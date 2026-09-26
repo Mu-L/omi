@@ -70,6 +70,14 @@ limit bounds accumulation; non-final and translated tokens do not enter the
 spoken transcript. Segment times use the provider's `start_ms` and `end_ms`,
 minus speech-profile preroll, rather than extending to the next token's start.
 
+Audio-timeline v2 retains at most the configured segment-buffer limit in each
+of its pending and unplaced fallback queues. If pending text fills the first
+queue, new text enters the legacy transaction as unplaced, retaining its ID
+and SEND conversation owner. A retry after an ambiguous commit filters IDs
+already stored inside that transaction. If both queues fill during a store
+outage, admission raises an explicit capacity error and emits a metric; the
+callback cannot buffer transcript indefinitely.
+
 When VAD requests finalization, Soniox queues a `{"type":"finalize"}` text
 control after accepted audio. Receive completion and synchronous `finish()`
 flush the last committed word exactly once; asynchronous draining awaits that
@@ -1024,9 +1032,21 @@ private capture window for live speaker identification.
 
 V2 keeps every emitted provider segment as text. Intervals crossing a VAD
 discontinuity, missing their owner, or arriving after owner closure are retained
-as `audio_alignment=unplaced` on the active conversation. Their persisted
+as `audio_alignment=unplaced` on their proven send owner. If no owner is
+provable, the current row is an explicit, counted degraded fallback. Their persisted
 `start=end=-1` cannot resolve to a v2 audio span in released clients, which
 seek by `start` alone. They are excluded from clip and speaker embedding work.
+The v2 persistence drain retries uncommitted text with stable IDs and bounded
+backoff. A successful owner write is excluded from later retries even if a
+different owner or photo write fails in the same drain; photos retry separately.
+After five failed v2 retries, each still-uncommitted segment moves once to
+the legacy segment transaction with its original ID and SEND owner, at
+`start=end=-1` and `audio_alignment=unplaced`. The fallback queue remains in
+the session drain with an eight-second retry delay if that transaction is also
+unavailable. The listen supervisor has a bounded shutdown drain, so this
+in-memory queue cannot survive a process loss during a simultaneous legacy
+store outage; a durable external dead-letter would be needed for that stronger
+guarantee. No v2 marker or speaker clip is created by the fallback.
 Mapped rows retain their accepted capture-run start for live merging; rows
 across a skipped VAD gap stay separate so merging cannot invent a wider window.
 The expected remaining speaker-recognition gap is the fraction of segments
